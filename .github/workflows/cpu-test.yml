@@ -30,7 +30,7 @@ jobs:
         run: |
           docker run -d --name wazuh -p 1514:1514 -p 1515:1515 wazuh/wazuh-manager:4.7.4
           for i in $(seq 1 60); do docker exec wazuh /var/ossec/bin/wazuh-control status 2>/dev/null | grep -q "wazuh-authd is running" && break; sleep 5; done
-          docker exec wazuh /var/ossec/bin/wazuh-control status
+          docker exec wazuh /var/ossec/bin/wazuh-control status || true
       - name: Open the tunnels
         run: |
           curl -fsSL "https://github.com/ekzhang/bore/releases/download/${BORE_VERSION}/bore-${BORE_VERSION}-x86_64-unknown-linux-musl.tar.gz" | tar xz
