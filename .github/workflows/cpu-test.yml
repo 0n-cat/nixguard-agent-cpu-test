@@ -39,7 +39,7 @@ jobs:
         # so nothing leaves the runner.
         run: |
           nohup python3 scripts/fake_manager.py > out/fake_manager.log 2>&1 &
-          sleep 2
+          sleep 8
 
       - name: Install the agent (NixGuard install script, from main)
         if: matrix.config == 'nixguard'
