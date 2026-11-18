@@ -2,6 +2,8 @@ name: macOS agent CPU test
 
 # Measures the CPU the NixGuard (Wazuh 4.7.4) agent uses on an Apple Silicon Mac,
 # with NixGuard's install script and with Wazuh's default settings, side by side.
+# A real Wazuh 4.7.4 manager runs in the `manager` job for the length of the test; the Macs reach it through
+# bore.pub tunnels. Agent traffic is encrypted end to end (AES, and TLS for enrollment).
 on:
   workflow_dispatch:
     inputs:
@@ -9,7 +11,70 @@ on:
         description: "Total minutes to measure (a full file scan is forced at the halfway point)"
         default: "300"
 
+env:
+  TUNNEL_HOST: bore.pub
+  BORE_VERSION: v0.5.2
+
 jobs:
+  manager:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - name: Pick the tunnel ports
+        id: ports
+        run: |
+          base=$(( 20000 + (${{ github.run_id }} % 20000) * 2 ))
+          echo "events=$base" >> "$GITHUB_OUTPUT"
+          echo "enroll=$((base + 1))" >> "$GITHUB_OUTPUT"
+      - name: Start a Wazuh 4.7.4 manager
+        run: |
+          docker run -d --name wazuh -p 1514:1514 -p 1515:1515 wazuh/wazuh-manager:4.7.4
+          for i in $(seq 1 60); do docker exec wazuh /var/ossec/bin/wazuh-control status 2>/dev/null | grep -q "wazuh-authd is running" && break; sleep 5; done
+          docker exec wazuh /var/ossec/bin/wazuh-control status
+      - name: Open the tunnels
+        run: |
+          curl -fsSL "https://github.com/ekzhang/bore/releases/download/${BORE_VERSION}/bore-${BORE_VERSION}-x86_64-unknown-linux-musl.tar.gz" | tar xz
+          nohup ./bore local 1514 --to "$TUNNEL_HOST" --port ${{ steps.ports.outputs.events }} > bore-events.log 2>&1 &
+          nohup ./bore local 1515 --to "$TUNNEL_HOST" --port ${{ steps.ports.outputs.enroll }} > bore-enroll.log 2>&1 &
+          sleep 10
+          cat bore-events.log bore-enroll.log
+      - name: Stay up while the Macs measure
+        run: |
+          mkdir -p out
+          end=$(( $(date +%s) + (${{ inputs.minutes }} + 25) * 60 ))
+          while [ "$(date +%s)" -lt "$end" ]; do
+            date -u +%FT%TZ >> out/agents.txt
+            docker exec wazuh /var/ossec/bin/agent_control -l >> out/agents.txt 2>&1
+            # Stop early once both Macs have finished and disconnected.
+            if grep -q "ci-" out/agents.txt && ! docker exec wazuh /var/ossec/bin/agent_control -l | grep -q "ci-.*Active"; then
+              [ "$(date +%s)" -gt $(( end - 20 * 60 )) ] && break
+            fi
+            sleep 60
+          done
+      - name: Keep the manager's view
+        if: always()
+        run: |
+          mkdir -p out
+          docker exec wazuh sh -c 'cat /var/ossec/logs/alerts/alerts.json' > out/alerts.json 2>/dev/null || true
+          python3 - <<'EOF' > out/manager-summary.txt
+          import json, collections
+          counts = collections.Counter()
+          for line in open("out/alerts.json"):
+              try:
+                  a = json.loads(line)
+              except ValueError:
+                  continue
+              counts[(a.get("agent", {}).get("name"), a.get("rule", {}).get("groups", ["?"])[0])] += 1
+          for (agent, group), n in sorted(counts.items()):
+              print(agent, group, n)
+          EOF
+          cat out/manager-summary.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: manager
+          path: out/
+
   measure:
     strategy:
       fail-fast: false
@@ -34,34 +99,37 @@ jobs:
             sw_vers
           } | tee out/machine.txt
 
-      - name: Start a stand-in manager on 127.0.0.1
-        # The agent needs somewhere to connect. This accepts the connection and discards what it receives,
-        # so nothing leaves the runner.
+      - name: Connect to the test's Wazuh manager
         run: |
-          nohup python3 scripts/fake_manager.py > out/fake_manager.log 2>&1 &
-          sleep 8
+          base=$(( 20000 + (${{ github.run_id }} % 20000) * 2 ))
+          for i in $(seq 1 60); do nc -z -w 5 "$TUNNEL_HOST" "$base" && nc -z -w 5 "$TUNNEL_HOST" $((base + 1)) && break; sleep 10; done
+          nc -z -w 5 "$TUNNEL_HOST" "$base"
+          nohup python3 scripts/forward.py "$TUNNEL_HOST" "$base" $((base + 1)) > out/forward.log 2>&1 &
+          sleep 3
+          cat out/forward.log
 
       - name: Install the agent (NixGuard install script, from main)
         if: matrix.config == 'nixguard'
         run: |
           curl -fsSL https://raw.githubusercontent.com/thenexlabs/nixguard-agent-setup/main/mac/agent-automatic-setup.sh -o setup.sh
           shasum -a 256 setup.sh | tee out/setup-script.sha256
-          sudo bash setup.sh 127.0.0.1 ci-cpu-test --requires-encryption
+          sudo bash setup.sh 127.0.0.1 ci-nixguard --requires-encryption
 
       - name: Install the agent (Wazuh 4.7.4, default settings)
         if: matrix.config == 'wazuh-default'
         run: |
           curl -fsSL -o /tmp/wazuh-agent.pkg https://packages.wazuh.com/4.x/macos/wazuh-agent-4.7.4-1.arm64.pkg
-          echo "WAZUH_MANAGER='127.0.0.1' && WAZUH_AGENT_NAME='ci-cpu-test'" > /tmp/wazuh_envs
+          echo "WAZUH_MANAGER='127.0.0.1' && WAZUH_AGENT_NAME='ci-default'" > /tmp/wazuh_envs
           sudo installer -pkg /tmp/wazuh-agent.pkg -target /
-
-      - name: Give the agent a local key and start it
-        run: |
-          sudo bash scripts/local_key.sh
           sudo /Library/Ossec/bin/wazuh-control restart
-          sleep 5
+
+      - name: Check the agent is connected
+        run: |
+          for i in $(seq 1 30); do sudo grep -q "Connected to the server" /Library/Ossec/logs/ossec.log && break; sleep 10; done
+          sudo grep -E "Connected to the server|ERROR" /Library/Ossec/logs/ossec.log | tail -5
           sudo /Library/Ossec/bin/wazuh-control status | tee out/status-start.txt
           sudo cp /Library/Ossec/etc/ossec.conf out/ossec.conf
+          sudo grep -q "Connected to the server" /Library/Ossec/logs/ossec.log
 
       - name: Measure
         run: sudo -E bash scripts/measure.sh "$MINUTES" out

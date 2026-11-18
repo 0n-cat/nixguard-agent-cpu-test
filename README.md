@@ -9,7 +9,7 @@ hosted `macos-15` runners. Two runs go side by side:
 
 Each run samples the agent's CPU every 5 seconds in three phases: just after install, steady in the
 background, and after a restart that forces a full file scan. A light workload runs throughout.
-The agent talks only to a stand-in manager on the runner itself; nothing is sent anywhere.
+The agents connect to a real Wazuh 4.7.4 manager that runs in the same workflow (the `manager` job), reached through a bore.pub tunnel. Agent traffic is encrypted (AES; TLS for enrollment).
 
 Results are in each run's summary and in its `results-*` artifact (`summary.md`, `intervals.csv`,
 `cpu.png`, the agent's `ossec.conf` and its log).
