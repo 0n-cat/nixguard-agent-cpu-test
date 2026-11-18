@@ -1,0 +1,81 @@
+name: macOS agent CPU test
+
+# Measures the CPU the NixGuard (Wazuh 4.7.4) agent uses on an Apple Silicon Mac,
+# with NixGuard's install script and with Wazuh's default settings, side by side.
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "Total minutes to measure (a full file scan is forced at the halfway point)"
+        default: "300"
+
+jobs:
+  measure:
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [nixguard, wazuh-default]
+    runs-on: macos-15
+    timeout-minutes: 350
+    env:
+      MINUTES: ${{ inputs.minutes }}
+      CONFIG: ${{ matrix.config }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Record the machine
+        run: |
+          mkdir -p out
+          {
+            echo "config: $CONFIG"
+            echo "cpu: $(sysctl -n machdep.cpu.brand_string)"
+            echo "cores: $(sysctl -n hw.ncpu)"
+            echo "memory_gb: $(( $(sysctl -n hw.memsize) / 1073741824 ))"
+            sw_vers
+          } | tee out/machine.txt
+
+      - name: Start a stand-in manager on 127.0.0.1
+        # The agent needs somewhere to connect. This accepts the connection and discards what it receives,
+        # so nothing leaves the runner.
+        run: |
+          nohup python3 scripts/fake_manager.py > out/fake_manager.log 2>&1 &
+          sleep 2
+
+      - name: Install the agent (NixGuard install script, from main)
+        if: matrix.config == 'nixguard'
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/thenexlabs/nixguard-agent-setup/main/mac/agent-automatic-setup.sh -o setup.sh
+          shasum -a 256 setup.sh | tee out/setup-script.sha256
+          sudo bash setup.sh 127.0.0.1 ci-cpu-test --requires-encryption
+
+      - name: Install the agent (Wazuh 4.7.4, default settings)
+        if: matrix.config == 'wazuh-default'
+        run: |
+          curl -fsSL -o /tmp/wazuh-agent.pkg https://packages.wazuh.com/4.x/macos/wazuh-agent-4.7.4-1.arm64.pkg
+          echo "WAZUH_MANAGER='127.0.0.1' && WAZUH_AGENT_NAME='ci-cpu-test'" > /tmp/wazuh_envs
+          sudo installer -pkg /tmp/wazuh-agent.pkg -target /
+
+      - name: Give the agent a local key and start it
+        run: |
+          sudo bash scripts/local_key.sh
+          sudo /Library/Ossec/bin/wazuh-control restart
+          sleep 5
+          sudo /Library/Ossec/bin/wazuh-control status | tee out/status-start.txt
+          sudo cp /Library/Ossec/etc/ossec.conf out/ossec.conf
+
+      - name: Measure
+        run: sudo -E bash scripts/measure.sh "$MINUTES" out
+
+      - name: Summarise
+        if: always()
+        run: |
+          python3 -m pip install --quiet --break-system-packages matplotlib || python3 -m pip install --quiet matplotlib || true
+          sudo chown -R "$(id -u)" out
+          python3 scripts/summarise.py out >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-${{ matrix.config }}
+          path: out/
